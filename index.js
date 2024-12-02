@@ -11,13 +11,13 @@ const io = require('socket.io')(http, {
 });
 
 // Game Constants
-const GAME_UPDATE_INTERVAL = 50; // 20 updates per second
+const GAME_UPDATE_INTERVAL = 50;
 const PLANT_TYPES = {
     SUNFLOWER: { 
         cost: 50, 
         health: 100, 
         name: 'Sunflower',
-        sunGenerationInterval: 20000, // 20 seconds
+        sunGenerationInterval: 20000,
         sunAmount: 25
     },
     PEASHOOTER: { 
@@ -25,7 +25,7 @@ const PLANT_TYPES = {
         health: 100, 
         damage: 20, 
         name: 'Peashooter',
-        shootInterval: 2000 // 2 seconds
+        shootInterval: 2000
     }
 };
 
@@ -35,7 +35,7 @@ const ZOMBIE_TYPES = {
         damage: 10, 
         speed: 0.5, 
         name: 'Basic Zombie',
-        attackInterval: 1000 // 1 second
+        attackInterval: 1000
     }
 };
 
@@ -54,12 +54,112 @@ setInterval(() => {
     }
 }, CLEANUP_INTERVAL);
 
+function checkWinConditions(game) {
+    const plantsLost = game.zombies.some(zombie => zombie.x <= 0);
+    const zombiesLost = game.zombies.length === 0 && game.plants.length > 0 && game.status === 'playing';
+
+    if (plantsLost) {
+        game.status = 'ended';
+        game.score.zombies += 1;
+        io.to(game.id).emit('gameEnded', { winner: 'zombies', score: game.score });
+        if (game.gameLoop) {
+            clearInterval(game.gameLoop);
+        }
+    } else if (zombiesLost) {
+        game.status = 'ended';
+        game.score.plants += 1;
+        io.to(game.id).emit('gameEnded', { winner: 'plants', score: game.score });
+        if (game.gameLoop) {
+            clearInterval(game.gameLoop);
+        }
+    }
+}
+
+function getGameState(game) {
+    return {
+        plants: game.plants,
+        zombies: game.zombies,
+        sun: game.sun,
+        score: game.score,
+        status: game.status
+    };
+}
+
+function startGameLoop(gameId) {
+    const game = games.get(gameId);
+    if (!game) return;
+
+    game.gameLoop = setInterval(() => {
+        updateGameState(game);
+        io.to(gameId).emit('gameUpdate', getGameState(game));
+    }, GAME_UPDATE_INTERVAL);
+}
+
+function updateGameState(game) {
+    const now = Date.now();
+    const deltaTime = (now - game.lastUpdate) / 1000;
+    game.lastUpdate = now;
+
+    // Update plants
+    game.plants.forEach(plant => {
+        // Sunflower sun generation
+        if (plant.type === 'SUNFLOWER') {
+            if (!plant.lastSunGeneration || now - plant.lastSunGeneration >= PLANT_TYPES.SUNFLOWER.sunGenerationInterval) {
+                game.sun += PLANT_TYPES.SUNFLOWER.sunAmount;
+                plant.lastSunGeneration = now;
+            }
+        }
+
+        // Peashooter attacks
+        if (plant.type === 'PEASHOOTER') {
+            if (now - plant.lastShot >= PLANT_TYPES.PEASHOOTER.shootInterval) {
+                const zombiesInRow = game.zombies.filter(z => 
+                    Math.floor(z.y) === Math.floor(plant.y) && z.x > plant.x
+                );
+                
+                if (zombiesInRow.length > 0) {
+                    const closestZombie = zombiesInRow.reduce((closest, current) => 
+                        current.x < closest.x ? current : closest
+                    );
+                    closestZombie.health -= PLANT_TYPES.PEASHOOTER.damage;
+                    plant.lastShot = now;
+                }
+            }
+        }
+    });
+
+    // Update zombies
+    game.zombies.forEach(zombie => {
+        const collidingPlant = game.plants.find(plant => 
+            Math.abs(zombie.x - plant.x) < 0.5 && 
+            Math.floor(plant.y) === Math.floor(zombie.y)
+        );
+
+        if (collidingPlant) {
+            if (now - zombie.lastAttack >= ZOMBIE_TYPES.BASIC.attackInterval) {
+                collidingPlant.health -= ZOMBIE_TYPES.BASIC.damage;
+                zombie.lastAttack = now;
+            }
+        } else {
+            zombie.x -= ZOMBIE_TYPES.BASIC.speed * deltaTime;
+        }
+    });
+
+    // Remove dead units
+    game.zombies = game.zombies.filter(zombie => zombie.health > 0);
+    game.plants = game.plants.filter(plant => plant.health > 0);
+
+    // Check win conditions
+    checkWinConditions(game);
+}
+
 io.on('connection', (socket) => {
     console.log('User connected:', socket.id);
 
     socket.on('createGame', () => {
         const gameId = Math.random().toString(36).substring(7);
         const newGame = {
+            id: gameId,
             plants: [],
             zombies: [],
             sun: 50,
@@ -103,7 +203,6 @@ io.on('connection', (socket) => {
         socket.emit('gameJoined', { gameId });
         io.to(gameId).emit('gameStart');
         
-        // Start game loop
         startGameLoop(gameId);
         console.log('Player joined game:', gameId);
     });
@@ -115,13 +214,11 @@ io.on('connection', (socket) => {
         const plantType = PLANT_TYPES[data.type];
         if (!plantType) return;
 
-        // Validate position
         if (data.x < 0 || data.x >= 9 || data.y < 0 || data.y >= 5) {
             socket.emit('error', { message: 'Invalid position!' });
             return;
         }
 
-        // Check if spot is taken
         const isSpotTaken = game.plants.some(plant => 
             Math.floor(plant.x) === Math.floor(data.x) && 
             Math.floor(plant.y) === Math.floor(data.y)
@@ -132,13 +229,11 @@ io.on('connection', (socket) => {
             return;
         }
 
-        // Check sun cost
         if (game.sun < plantType.cost) {
             socket.emit('error', { message: 'Not enough sun!' });
             return;
         }
 
-        // Place plant
         game.sun -= plantType.cost;
         game.plants.push({
             type: data.type,
@@ -156,22 +251,17 @@ io.on('connection', (socket) => {
         const game = games.get(data.gameId);
         if (!game || game.status !== 'playing') return;
 
-        const zombieType = ZOMBIE_TYPES[data.type];
-        if (!zombieType) return;
-
-        // Validate position (only rightmost column)
-        if (data.x !== 8 || data.y < 0 || data.y >= 5) {
+        if (data.y < 0 || data.y >= 5) {
             socket.emit('error', { message: 'Invalid position!' });
             return;
         }
 
-        // Place zombie
         game.zombies.push({
-            type: data.type,
-            x: data.x,
+            type: 'BASIC',
+            x: 8,
             y: data.y,
-            health: zombieType.health,
-            speed: zombieType.speed,
+            health: ZOMBIE_TYPES.BASIC.health,
+            speed: ZOMBIE_TYPES.BASIC.speed,
             lastAttack: Date.now()
         });
 
@@ -180,7 +270,6 @@ io.on('connection', (socket) => {
 
     socket.on('disconnect', () => {
         console.log('User disconnected:', socket.id);
-        // Clean up any games this player was in
         for (const [gameId, game] of games.entries()) {
             if (game.players.includes(socket.id)) {
                 io.to(gameId).emit('gameEnded', { 
@@ -196,109 +285,6 @@ io.on('connection', (socket) => {
         }
     });
 });
-
-function startGameLoop(gameId) {
-    const game = games.get(gameId);
-    if (!game) return;
-
-    game.gameLoop = setInterval(() => {
-        updateGameState(game);
-        io.to(gameId).emit('gameUpdate', getGameState(game));
-    }, GAME_UPDATE_INTERVAL);
-}
-
-function updateGameState(game) {
-    const now = Date.now();
-    const deltaTime = (now - game.lastUpdate) / 1000;
-    game.lastUpdate = now;
-
-    // Генерация солнца от подсолнухов (исправлено)
-    game.plants.forEach(plant => {
-        if (plant.type === 'SUNFLOWER') {
-            if (!plant.lastSunGeneration || now - plant.lastSunGeneration >= 20000) {
-                game.sun += 25;
-                plant.lastSunGeneration = now;
-            }
-        }
-    });
-
-    // Обработка зомби
-    game.zombies.forEach(zombie => {
-        const collidingPlant = game.plants.find(plant => 
-            Math.abs(zombie.x - plant.x) < 0.5 && 
-            Math.floor(plant.y) === Math.floor(zombie.y)
-        );
-
-        if (collidingPlant) {
-            if (now - zombie.lastAttack >= 1000) {
-                collidingPlant.health -= ZOMBIE_TYPES[zombie.type].damage;
-                zombie.lastAttack = now;
-            }
-        } else {
-            zombie.x -= zombie.speed * deltaTime;
-        }
-    });
-
-    // Стрельба горохострелов
-    game.plants.forEach(plant => {
-        if (plant.type === 'PEASHOOTER') {
-            if (now - plant.lastShot >= 2000) {
-                const zombiesInRow = game.zombies.filter(z => 
-                    Math.floor(z.y) === Math.floor(plant.y) && 
-                    z.x > plant.x
-                );
-                
-                if (zombiesInRow.length > 0) {
-                    const closestZombie = zombiesInRow.reduce((closest, current) => 
-                        current.x < closest.x ? current : closest
-                    );
-                    closestZombie.health -= PLANT_TYPES.PEASHOOTER.damage;
-                    plant.lastShot = now;
-                }
-            }
-        }
-    });
-
-    // Удаление мертвых юнитов
-    game.zombies = game.zombies.filter(zombie => zombie.health > 0);
-    game.plants = game.plants.filter(plant => plant.health > 0);
-
-    // Проверка условий победы
-    checkWinConditions(game);
-}
-
-// Исправляем обработку размещения зомби
-socket.on('placeZombie', (data) => {
-    const game = games.get(data.gameId);
-    if (!game) return;
-
-    // Убираем лишние проверки, оставляем только валидацию позиции по Y
-    if (data.y < 0 || data.y >= 5) {
-        socket.emit('error', { message: 'Invalid position!' });
-        return;
-    }
-
-    game.zombies.push({
-        type: 'BASIC',
-        x: 8, // Всегда ставим в крайний правый столбец
-        y: data.y,
-        health: ZOMBIE_TYPES.BASIC.health,
-        speed: ZOMBIE_TYPES.BASIC.speed,
-        lastAttack: Date.now()
-    });
-
-    io.to(data.gameId).emit('gameUpdate', getGameState(game));
-});
-
-function getGameState(game) {
-    return {
-        plants: game.plants,
-        zombies: game.zombies,
-        sun: game.sun,
-        score: game.score,
-        status: game.status
-    };
-}
 
 const PORT = process.env.PORT || 3000;
 http.listen(PORT, () => {
