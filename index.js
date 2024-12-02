@@ -17,7 +17,7 @@ const PLANT_TYPES = {
         cost: 50, 
         health: 100, 
         name: 'Sunflower',
-        sunGenerationInterval: 20000,
+        sunGenerationInterval: 7000,
         sunAmount: 25
     },
     PEASHOOTER: { 
