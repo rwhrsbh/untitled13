@@ -212,77 +212,83 @@ function updateGameState(game) {
     const deltaTime = (now - game.lastUpdate) / 1000;
     game.lastUpdate = now;
 
-    // Update zombies
+    // Генерация солнца от подсолнухов (исправлено)
+    game.plants.forEach(plant => {
+        if (plant.type === 'SUNFLOWER') {
+            if (!plant.lastSunGeneration || now - plant.lastSunGeneration >= 20000) {
+                game.sun += 25;
+                plant.lastSunGeneration = now;
+            }
+        }
+    });
+
+    // Обработка зомби
     game.zombies.forEach(zombie => {
-        const zombieType = ZOMBIE_TYPES[zombie.type];
-        
-        // Find colliding plant
         const collidingPlant = game.plants.find(plant => 
             Math.abs(zombie.x - plant.x) < 0.5 && 
             Math.floor(plant.y) === Math.floor(zombie.y)
         );
 
         if (collidingPlant) {
-            // Attack plant
-            if (now - zombie.lastAttack >= zombieType.attackInterval) {
-                collidingPlant.health -= zombieType.damage;
+            if (now - zombie.lastAttack >= 1000) {
+                collidingPlant.health -= ZOMBIE_TYPES[zombie.type].damage;
                 zombie.lastAttack = now;
             }
         } else {
-            // Move forward
             zombie.x -= zombie.speed * deltaTime;
         }
     });
 
-    // Update plants
+    // Стрельба горохострелов
     game.plants.forEach(plant => {
-        const plantType = PLANT_TYPES[plant.type];
-
-        // Sunflower sun generation
-        if (plant.type === 'SUNFLOWER' && 
-            now - plant.lastSunGeneration >= plantType.sunGenerationInterval) {
-            game.sun += plantType.sunAmount;
-            plant.lastSunGeneration = now;
-        }
-
-        // Peashooter attacks
-        if (plant.type === 'PEASHOOTER' && 
-            now - plant.lastShot >= plantType.shootInterval) {
-            const zombiesInRow = game.zombies.filter(z => 
-                Math.floor(z.y) === Math.floor(plant.y) && 
-                z.x > plant.x
-            );
-            
-            if (zombiesInRow.length > 0) {
-                const closestZombie = zombiesInRow.reduce((closest, current) => 
-                    current.x < closest.x ? current : closest
+        if (plant.type === 'PEASHOOTER') {
+            if (now - plant.lastShot >= 2000) {
+                const zombiesInRow = game.zombies.filter(z => 
+                    Math.floor(z.y) === Math.floor(plant.y) && 
+                    z.x > plant.x
                 );
-                closestZombie.health -= plantType.damage;
-                plant.lastShot = now;
+                
+                if (zombiesInRow.length > 0) {
+                    const closestZombie = zombiesInRow.reduce((closest, current) => 
+                        current.x < closest.x ? current : closest
+                    );
+                    closestZombie.health -= PLANT_TYPES.PEASHOOTER.damage;
+                    plant.lastShot = now;
+                }
             }
         }
     });
 
-    // Remove dead units
+    // Удаление мертвых юнитов
     game.zombies = game.zombies.filter(zombie => zombie.health > 0);
     game.plants = game.plants.filter(plant => plant.health > 0);
 
-    // Check win conditions
-    const plantsLost = game.zombies.some(zombie => zombie.x <= 0);
-    const zombiesLost = game.zombies.length === 0 && game.plants.length > 0;
-
-    if (plantsLost) {
-        game.status = 'ended';
-        game.score.zombies += 1;
-        io.to(gameId).emit('gameEnded', { winner: 'zombies', score: game.score });
-        clearInterval(game.gameLoop);
-    } else if (zombiesLost) {
-        game.status = 'ended';
-        game.score.plants += 1;
-        io.to(gameId).emit('gameEnded', { winner: 'plants', score: game.score });
-        clearInterval(game.gameLoop);
-    }
+    // Проверка условий победы
+    checkWinConditions(game);
 }
+
+// Исправляем обработку размещения зомби
+socket.on('placeZombie', (data) => {
+    const game = games.get(data.gameId);
+    if (!game) return;
+
+    // Убираем лишние проверки, оставляем только валидацию позиции по Y
+    if (data.y < 0 || data.y >= 5) {
+        socket.emit('error', { message: 'Invalid position!' });
+        return;
+    }
+
+    game.zombies.push({
+        type: 'BASIC',
+        x: 8, // Всегда ставим в крайний правый столбец
+        y: data.y,
+        health: ZOMBIE_TYPES.BASIC.health,
+        speed: ZOMBIE_TYPES.BASIC.speed,
+        lastAttack: Date.now()
+    });
+
+    io.to(data.gameId).emit('gameUpdate', getGameState(game));
+});
 
 function getGameState(game) {
     return {
