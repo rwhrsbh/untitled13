@@ -14,11 +14,11 @@ const io = require('socket.io')(http, {
 const GAME_UPDATE_INTERVAL = 50; // 20 updates per second
 
 const WAVE_SYSTEM = {
-    POINTS_PER_WAVE: 100,    // Начальные очки на волну
-    POINTS_INCREMENT: 50,     // Увеличение очков каждую волну
-    WAVE_DURATION: 60000,     // Длительность волны (60 секунд)
-    BREAK_DURATION: 20000,    // Перерыв между волнами (20 секунд)
-    TOTAL_WAVES: 5           // Количество волн для победы
+    POINTS_PER_WAVE: 100,    // Starting points per wave
+    POINTS_INCREMENT: 50,     // Points increase per wave
+    WAVE_DURATION: 60000,     // Wave duration (60 seconds)
+    BREAK_DURATION: 20000,    // Break between waves (20 seconds)
+    TOTAL_WAVES: 5           // Waves needed for plant victory
 };
 
 const PLANT_TYPES = {
@@ -26,7 +26,7 @@ const PLANT_TYPES = {
         cost: 50, 
         health: 100, 
         name: 'Sunflower',
-        sunGenerationInterval: 20000,
+        sunGenerationInterval: 20000, // 20 seconds
         sunAmount: 25
     },
     PEASHOOTER: { 
@@ -34,7 +34,7 @@ const PLANT_TYPES = {
         health: 100, 
         damage: 20, 
         name: 'Peashooter',
-        shootInterval: 2000
+        shootInterval: 2000 // 2 seconds
     }
 };
 
@@ -82,61 +82,68 @@ const ZOMBIE_TYPES = {
 };
 
 const AMBULANCE = {
-    width: 120,
-    height: 60,
     speed: 2,
-    damage: 1000
+    damage: 1000, // Instant kill for zombies
+    width: 120,
+    height: 60
 };
+
+// Game state for each active game
+class Game {
+    constructor() {
+        this.plants = [];
+        this.zombies = [];
+        this.sun = 50;
+        this.players = [];
+        this.status = 'waiting';
+        this.currentWave = 0;
+        this.wavePoints = WAVE_SYSTEM.POINTS_PER_WAVE;
+        this.waveStartTime = 0;
+        this.waveStatus = 'break';
+        this.lastUpdate = Date.now();
+        this.ambulances = this.initAmbulances();
+        this.score = { plants: 0, zombies: 0 };
+    }
+
+    initAmbulances() {
+        return Array(5).fill(null).map((_, row) => ({
+            row,
+            x: -0.5,
+            active: false,
+            used: false,
+            state: 'idle'
+        }));
+    }
+}
 
 // Store active games
 const games = new Map();
 
-function createNewGame() {
+// Helper function to get game state for client
+function getGameState(game) {
     return {
-        plants: [],
-        zombies: [],
-        sun: 50,
-        players: [],
-        status: 'waiting',
-        lastUpdate: Date.now(),
-        currentWave: 0,
-        wavePoints: WAVE_SYSTEM.POINTS_PER_WAVE,
-        waveStartTime: 0,
-        waveStatus: 'break',
-        zombieQueue: [],
-        score: {
-            plants: 0,
-            zombies: 0
-        },
-        ambulances: initAmbulances(),
-        gameLoop: null
+        plants: game.plants,
+        zombies: game.zombies,
+        sun: game.sun,
+        status: game.status,
+        currentWave: game.currentWave,
+        waveStatus: game.waveStatus,
+        wavePoints: game.wavePoints,
+        waveStartTime: game.waveStartTime,
+        ambulances: game.ambulances,
+        score: game.score
     };
 }
 
-function initAmbulances() {
-    const ambulances = [];
-    for (let row = 0; row < 5; row++) {
-        ambulances.push({
-            row: row,
-            x: -0.5,
-            active: false,
-            used: false,
-            state: 'idle',
-            animationFrame: 0
-        });
-    }
-    return ambulances;
-}
-
+// Socket connection handling
 io.on('connection', (socket) => {
     console.log('User connected:', socket.id);
 
     socket.on('createGame', () => {
         const gameId = Math.random().toString(36).substring(7);
-        const newGame = createNewGame();
-        newGame.players.push(socket.id);
-        
-        games.set(gameId, newGame);
+        const game = new Game();
+        game.players.push(socket.id);
+        games.set(gameId, game);
         socket.join(gameId);
         socket.emit('gameCreated', { gameId });
         console.log('Game created:', gameId);
@@ -148,6 +155,7 @@ io.on('connection', (socket) => {
             socket.emit('error', { message: 'Game not found!' });
             return;
         }
+        
         if (game.players.length >= 2) {
             socket.emit('error', { message: 'Game is full!' });
             return;
@@ -163,7 +171,6 @@ io.on('connection', (socket) => {
         io.to(gameId).emit('gameStart');
         
         startGameLoop(gameId);
-        console.log('Player joined game:', gameId);
     });
 
     socket.on('placePlant', (data) => {
@@ -173,11 +180,13 @@ io.on('connection', (socket) => {
         const plantType = PLANT_TYPES[data.type];
         if (!plantType) return;
 
+        // Validate position
         if (data.x < 0 || data.x >= 9 || data.y < 0 || data.y >= 5) {
             socket.emit('error', { message: 'Invalid position!' });
             return;
         }
 
+        // Check if spot is taken
         const isSpotTaken = game.plants.some(plant => 
             Math.floor(plant.x) === Math.floor(data.x) && 
             Math.floor(plant.y) === Math.floor(data.y)
@@ -188,11 +197,13 @@ io.on('connection', (socket) => {
             return;
         }
 
+        // Check sun cost
         if (game.sun < plantType.cost) {
             socket.emit('error', { message: 'Not enough sun!' });
             return;
         }
 
+        // Place plant
         game.sun -= plantType.cost;
         game.plants.push({
             type: data.type,
@@ -210,22 +221,25 @@ io.on('connection', (socket) => {
         const game = games.get(data.gameId);
         if (!game || game.status !== 'playing' || game.waveStatus !== 'active') return;
 
-        const zombieType = ZOMBIE_TYPES[data.type];
+        const zombieType = ZOMBIE_TYPES[data.type || 'BASIC'];
         if (!zombieType) return;
 
+        // Validate position
         if (data.y < 0 || data.y >= 5) {
             socket.emit('error', { message: 'Invalid position!' });
             return;
         }
 
+        // Check points cost
         if (zombieType.cost > game.wavePoints) {
             socket.emit('error', { message: 'Not enough points!' });
             return;
         }
 
+        // Place zombie
         game.wavePoints -= zombieType.cost;
         game.zombies.push({
-            type: data.type,
+            type: data.type || 'BASIC',
             x: 8,
             y: data.y,
             health: zombieType.health,
@@ -244,27 +258,26 @@ io.on('connection', (socket) => {
                     reason: 'Player disconnected',
                     winner: game.players[0] === socket.id ? 'zombies' : 'plants'
                 });
-                if (game.gameLoop) {
-                    clearInterval(game.gameLoop);
-                }
                 games.delete(gameId);
-                console.log('Game cleaned up:', gameId);
             }
         }
     });
 });
 
 function startGameLoop(gameId) {
-    const game = games.get(gameId);
-    if (!game) return;
+    const interval = setInterval(() => {
+        const game = games.get(gameId);
+        if (!game || game.status === 'ended') {
+            clearInterval(interval);
+            return;
+        }
 
-    game.gameLoop = setInterval(() => {
-        updateGameState(game);
+        updateGameState(game, gameId);
         io.to(gameId).emit('gameUpdate', getGameState(game));
     }, GAME_UPDATE_INTERVAL);
 }
 
-function updateGameState(game) {
+function updateGameState(game, gameId) {
     const now = Date.now();
     const deltaTime = (now - game.lastUpdate) / 1000;
     game.lastUpdate = now;
@@ -278,6 +291,13 @@ function updateGameState(game) {
     } else if (game.waveStatus === 'break') {
         if (now - game.waveStartTime >= WAVE_SYSTEM.BREAK_DURATION) {
             game.currentWave++;
+            if (game.currentWave >= WAVE_SYSTEM.TOTAL_WAVES) {
+                // Plants win if all waves completed
+                if (game.zombies.length === 0) {
+                    endGame(game, 'plants', gameId);
+                    return;
+                }
+            }
             game.wavePoints = WAVE_SYSTEM.POINTS_PER_WAVE + 
                              (game.currentWave * WAVE_SYSTEM.POINTS_INCREMENT);
             game.waveStatus = 'active';
@@ -298,6 +318,7 @@ function updateGameState(game) {
                 }
             });
 
+            // Deactivate ambulance when it reaches the end
             if (ambulance.x > 9) {
                 ambulance.used = true;
                 ambulance.state = 'used';
@@ -309,17 +330,20 @@ function updateGameState(game) {
     game.zombies.forEach(zombie => {
         const zombieType = ZOMBIE_TYPES[zombie.type];
         
+        // Find colliding plant
         const collidingPlant = game.plants.find(plant => 
             Math.abs(zombie.x - plant.x) < 0.5 && 
             Math.floor(plant.y) === Math.floor(zombie.y)
         );
 
         if (collidingPlant) {
+            // Attack plant
             if (now - zombie.lastAttack >= zombieType.attackInterval) {
                 collidingPlant.health -= zombieType.damage;
                 zombie.lastAttack = now;
             }
         } else {
+            // Move forward
             zombie.x -= zombie.speed * deltaTime;
             
             // Check if zombie reached the house
@@ -330,10 +354,9 @@ function updateGameState(game) {
                 if (ambulance) {
                     ambulance.active = true;
                 } else {
-                    game.status = 'ended';
-                    game.score.zombies += 1;
-                    io.to(gameId).emit('gameEnded', { winner: 'zombies', score: game.score });
-                    clearInterval(game.gameLoop);
+                    // Zombies win if they reach the house with no ambulance
+                    endGame(game, 'zombies', gameId);
+                    return;
                 }
             }
         }
@@ -342,12 +365,14 @@ function updateGameState(game) {
     // Update plants
     game.plants.forEach(plant => {
         if (plant.type === 'SUNFLOWER') {
+            // Generate sun
             if (now - plant.lastSunGeneration >= PLANT_TYPES.SUNFLOWER.sunGenerationInterval) {
                 game.sun += PLANT_TYPES.SUNFLOWER.sunAmount;
                 plant.lastSunGeneration = now;
             }
         }
         else if (plant.type === 'PEASHOOTER') {
+            // Shoot zombies
             if (now - plant.lastShot >= PLANT_TYPES.PEASHOOTER.shootInterval) {
                 const zombiesInRow = game.zombies.filter(z => 
                     Math.floor(z.y) === Math.floor(plant.y) && 
@@ -368,36 +393,15 @@ function updateGameState(game) {
     // Remove dead units
     game.zombies = game.zombies.filter(zombie => zombie.health > 0);
     game.plants = game.plants.filter(plant => plant.health > 0);
-
-    // Check win/lose conditions
-    checkGameEnd(game);
 }
 
-function checkGameEnd(game) {
-    // Plants win if all waves are completed and no zombies left
-    if (game.currentWave >= WAVE_SYSTEM.TOTAL_WAVES && 
-        game.zombies.length === 0 && 
-        game.waveStatus === 'break') {
-        game.status = 'ended';
-        game.score.plants += 1;
-        io.to(gameId).emit('gameEnded', { winner: 'plants', score: game.score });
-        clearInterval(game.gameLoop);
-    }
-}
-
-function getGameState(game) {
-    return {
-        plants: game.plants,
-        zombies: game.zombies,
-        sun: game.sun,
-        score: game.score,
-        status: game.status,
-        currentWave: game.currentWave,
-        waveStatus: game.waveStatus,
-        wavePoints: game.wavePoints,
-        waveStartTime: game.waveStartTime,
-        ambulances: game.ambulances
-    };
+function endGame(game, winner, gameId) {
+    game.status = 'ended';
+    game.score[winner]++;
+    io.to(gameId).emit('gameEnded', { 
+        winner: winner,
+        score: game.score
+    });
 }
 
 const PORT = process.env.PORT || 3000;
